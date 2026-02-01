@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
- * Interactive MCP Client with Claude AI
+ * Interactive MCP Client with Claude AI - Multi-Server Support
  *
- * An AI-powered CLI that uses Claude to interact with MCP servers.
- * Claude can read resources, call tools, and have conversations about the data.
+ * An AI-powered CLI that uses Claude to interact with multiple MCP servers.
+ * Authenticates once, connects to all servers at startup (XAA happens here),
+ * then routes tool calls to the appropriate server using existing connections.
  */
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -13,9 +14,9 @@ import {
   applyMiddlewares,
   withCrossAppAccess,
 } from '@modelcontextprotocol/client';
+import * as client from 'openid-client';
 import express from 'express';
 import open from 'open';
-import crypto from 'node:crypto';
 import readline from 'node:readline';
 import dotenv from 'dotenv';
 import chalk from 'chalk';
@@ -23,80 +24,172 @@ import ora from 'ora';
 
 dotenv.config();
 
-// Configuration
-const config = {
-  idpUrl: process.env.IDP_URL || 'http://localhost:4000',
-  authServerUrl: process.env.AUTH_SERVER_URL || 'http://localhost:5001',
-  mcpServerUrl: process.env.MCP_SERVER_URL || 'http://localhost:5002',
-  clientId: process.env.CLIENT_ID || 'mcp-tester',
-  clientSecret: process.env.CLIENT_SECRET || 'secret-mcp-tester',
-  callbackPort: parseInt(process.env.CALLBACK_PORT || '3333', 10),
-  mcpAudience: process.env.MCP_AUDIENCE || 'http://localhost:5002/mcp',
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-};
+// OAuth Protected Resource Metadata (RFC 9470)
+interface OAuthProtectedResourceMetadata {
+  resource: string;
+  authorization_servers: string[];
+  bearer_methods_supported?: string[];
+  scopes_supported?: string[];
+  resource_documentation?: string;
+}
 
-const REDIRECT_URI = `http://localhost:${config.callbackPort}/callback`;
-
-// Types
-interface McpTool {
+// Tool definition for configuration
+interface ToolDefinition {
   name: string;
-  description?: string;
+  description: string;
   inputSchema: Record<string, unknown>;
 }
 
-interface McpResource {
+// Resource definition for configuration
+interface ResourceDefinition {
   uri: string;
   name: string;
   description?: string;
 }
 
-// PKCE helpers
-function generateCodeVerifier(): string {
-  return crypto.randomBytes(32).toString('base64url');
+// MCP Server configuration with known tools
+interface McpServerConfig {
+  name: string;
+  url: string;
+  authServerUrl?: string;  // Can be auto-discovered
+  audience?: string;
+  scopes?: string[];
+  // Pre-configured tools (optional - can also be fetched from metadata endpoint)
+  tools?: ToolDefinition[];
+  resources?: ResourceDefinition[];
 }
 
-function generateCodeChallenge(verifier: string): string {
-  return crypto.createHash('sha256').update(verifier).digest('base64url');
+// Connected MCP Server (lazy - only created when needed)
+interface ConnectedMcpServer {
+  config: McpServerConfig;
+  client: Client;
+  oauthMetadata?: OAuthProtectedResourceMetadata;
 }
 
-// Decode JWT
-function decodeJwt(token: string): Record<string, unknown> {
+// Global configuration
+const config = {
+  idpUrl: process.env.IDP_URL || 'http://localhost:4000',
+  clientId: process.env.CLIENT_ID || 'mcp-tester',
+  clientSecret: process.env.CLIENT_SECRET || 'secret-mcp-tester',
+  callbackPort: parseInt(process.env.CALLBACK_PORT || '3333', 10),
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+};
+
+// MCP Servers configuration - with pre-defined tools for lazy loading
+const mcpServers: McpServerConfig[] = [
+  {
+    name: process.env.MCP_SERVER_1_NAME || 'qrty',
+    url: process.env.MCP_SERVER_1_URL || 'https://mcp.qrty.page',
+    authServerUrl: process.env.MCP_SERVER_1_AUTH_URL,  // Auto-discovered if not set
+    audience: process.env.MCP_SERVER_1_AUDIENCE,
+    scopes: process.env.MCP_SERVER_1_SCOPES?.split(','),
+    // Tools will be fetched from /.well-known/mcp-manifest or similar
+  },
+  {
+    name: process.env.MCP_SERVER_2_NAME || 'xaa-dev',
+    url: process.env.MCP_SERVER_2_URL || 'https://mcp.xaa.dev',
+    authServerUrl: process.env.MCP_SERVER_2_AUTH_URL || 'https://auth.resource.xaa.dev',
+    audience: process.env.MCP_SERVER_2_AUDIENCE || 'https://mcp.xaa.dev/mcp',
+    scopes: process.env.MCP_SERVER_2_SCOPES?.split(',') || ['todos.read', 'mcp.access'],
+    // Tools will be fetched from /.well-known/mcp-manifest or similar
+  },
+].filter(s => s.url);
+
+const REDIRECT_URI = `http://localhost:${config.callbackPort}/callback`;
+
+// Lazy connection state
+let idToken: string | null = null;
+const connectedServers = new Map<string, ConnectedMcpServer>();
+const serverConfigs = new Map<string, McpServerConfig>();
+const toolServerMap = new Map<string, string>();
+const resourceServerMap = new Map<string, string>();
+
+// All known tools and resources (from metadata, not connection)
+const allTools: ToolDefinition[] = [];
+const allResources: ResourceDefinition[] = [];
+
+// Discover OAuth Protected Resource Metadata (RFC 9470)
+async function discoverOAuthMetadata(mcpServerUrl: string): Promise<OAuthProtectedResourceMetadata | null> {
   try {
-    const parts = token.split('.');
-    return JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+    const baseUrl = new URL(mcpServerUrl);
+    const wellKnownUrl = `${baseUrl.origin}/.well-known/oauth-protected-resource`;
+
+    const response = await fetch(wellKnownUrl);
+    if (!response.ok) {
+      return null;
+    }
+
+    const metadata = await response.json() as OAuthProtectedResourceMetadata;
+    return metadata;
   } catch {
-    return { error: 'Failed to decode' };
+    return null;
   }
 }
 
-// OAuth flow
+// Fetch MCP server manifest (tools/resources without full connection)
+async function fetchServerManifest(serverConfig: McpServerConfig): Promise<{ tools: ToolDefinition[], resources: ResourceDefinition[] }> {
+  try {
+    // Try to fetch from well-known endpoint first
+    const manifestUrl = `${serverConfig.url}/.well-known/mcp-manifest`;
+    const response = await fetch(manifestUrl);
+
+    if (response.ok) {
+      const manifest = await response.json() as { tools?: ToolDefinition[], resources?: ResourceDefinition[] };
+      return {
+        tools: manifest.tools || [],
+        resources: manifest.resources || [],
+      };
+    }
+  } catch {
+    // Manifest endpoint not available
+  }
+
+  // Fall back to configured tools/resources
+  return {
+    tools: serverConfig.tools || [],
+    resources: serverConfig.resources || [],
+  };
+}
+
+// OAuth flow using openid-client library
 async function authenticate(): Promise<string> {
-  const spinner = ora('Starting authentication...').start();
+  const spinner = ora('Discovering OIDC configuration...').start();
 
-  const state = crypto.randomUUID();
-  const codeVerifier = generateCodeVerifier();
-  const codeChallenge = generateCodeChallenge(codeVerifier);
+  // Discover OIDC configuration from the IDP
+  const issuerUrl = new URL(config.idpUrl);
+  const oidcConfig = await client.discovery(issuerUrl, config.clientId, config.clientSecret);
 
-  let resolveAuthCode: (code: string) => void;
-  const authCodePromise = new Promise<string>((resolve) => {
-    resolveAuthCode = resolve;
+  spinner.text = 'Starting authentication...';
+
+  // Generate PKCE code verifier (openid-client handles challenge internally)
+  const codeVerifier = client.randomPKCECodeVerifier();
+  const codeChallenge = await client.calculatePKCECodeChallenge(codeVerifier);
+
+  // Generate state and nonce for security
+  const state = client.randomState();
+  const nonce = client.randomNonce();
+
+  // Build authorization URL
+  const authParams = new URLSearchParams({
+    redirect_uri: REDIRECT_URI,
+    scope: 'openid profile email',
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+    state,
+    nonce,
+  });
+
+  const authUrl = client.buildAuthorizationUrl(oidcConfig, authParams);
+
+  // Start local server to receive callback
+  let resolveCallback: (url: URL) => void;
+  const callbackPromise = new Promise<URL>((resolve) => {
+    resolveCallback = resolve;
   });
 
   const app = express();
   app.get('/callback', (req, res) => {
-    const code = req.query.code as string;
-    const returnedState = req.query.state as string;
-    const error = req.query.error as string;
-
-    if (error) {
-      res.send(`<h1>Error</h1><p>${error}</p>`);
-      return;
-    }
-
-    if (returnedState !== state) {
-      res.send('<h1>Error</h1><p>State mismatch</p>');
-      return;
-    }
+    const callbackUrl = new URL(req.url, `http://localhost:${config.callbackPort}`);
 
     res.send(`
       <html>
@@ -108,75 +201,96 @@ async function authenticate(): Promise<string> {
         </body>
       </html>
     `);
-    resolveAuthCode(code);
+    resolveCallback(callbackUrl);
   });
 
   const server = app.listen(config.callbackPort);
 
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: config.clientId,
-    redirect_uri: REDIRECT_URI,
-    scope: 'openid profile email',
-    state,
-    nonce: crypto.randomUUID(),
-    code_challenge: codeChallenge,
-    code_challenge_method: 'S256',
-  });
-
-  const authUrl = `${config.idpUrl}/authorize?${params.toString()}`;
   spinner.text = 'Opening browser for login...';
-  await open(authUrl);
+  await open(authUrl.href);
 
   spinner.text = 'Waiting for authentication...';
-  const code = await authCodePromise;
+  const callbackUrl = await callbackPromise;
   server.close();
 
   spinner.text = 'Exchanging code for tokens...';
-  const tokenResponse = await fetch(`${config.idpUrl}/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      redirect_uri: REDIRECT_URI,
-      client_id: config.clientId,
-      client_secret: config.clientSecret,
-      code_verifier: codeVerifier,
-    }),
+
+  // Exchange authorization code for tokens using openid-client
+  const tokens = await client.authorizationCodeGrant(oidcConfig, callbackUrl, {
+    pkceCodeVerifier: codeVerifier,
+    expectedState: state,
+    expectedNonce: nonce,
+    idTokenExpected: true,
   });
 
-  if (!tokenResponse.ok) {
-    throw new Error(`Token exchange failed: ${await tokenResponse.text()}`);
+  const idTokenValue = tokens.id_token;
+  if (!idTokenValue) {
+    throw new Error('No ID token received');
   }
 
-  const tokens = await tokenResponse.json() as { id_token: string; access_token?: string };
-  const userInfo = decodeJwt(tokens.id_token);
-  spinner.succeed(`Authenticated as ${chalk.cyan(userInfo.email || userInfo.sub)}`);
+  // Get claims from ID token for display
+  const claims = tokens.claims();
+  const userEmail = claims?.email || claims?.sub || 'unknown';
+  spinner.succeed(`Authenticated as ${chalk.cyan(userEmail)}`);
+  console.log(chalk.gray('  ID token stored for Cross-App Access (XAA) - connections are lazy'));
 
-  return tokens.id_token;
+  return idTokenValue;
 }
 
-// Connect to MCP with SDK middleware
-async function connectToMcp(idToken: string): Promise<Client> {
-  const spinner = ora('Connecting to MCP server...').start();
+// Connect to a single MCP server ON DEMAND (lazy connection with XAA)
+async function connectToServer(serverName: string): Promise<ConnectedMcpServer> {
+  // Check if already connected
+  const existing = connectedServers.get(serverName);
+  if (existing) {
+    return existing;
+  }
 
+  const serverConfig = serverConfigs.get(serverName);
+  if (!serverConfig) {
+    throw new Error(`Unknown server: ${serverName}`);
+  }
+
+  if (!idToken) {
+    throw new Error('Not authenticated');
+  }
+
+  console.log(chalk.yellow(`  → Connecting to ${serverName} (XAA flow starting)...`));
+
+  // Discover OAuth metadata if auth server not configured
+  let oauthMetadata: OAuthProtectedResourceMetadata | null = null;
+  if (!serverConfig.authServerUrl) {
+    oauthMetadata = await discoverOAuthMetadata(serverConfig.url);
+    if (!oauthMetadata) {
+      throw new Error(`Failed to discover OAuth metadata for ${serverName}`);
+    }
+  }
+
+  // Determine auth configuration
+  const authServerUrl = serverConfig.authServerUrl || oauthMetadata?.authorization_servers?.[0];
+  const resourceUrl = serverConfig.audience || oauthMetadata?.resource || serverConfig.url;
+  const scopes = serverConfig.scopes || oauthMetadata?.scopes_supported || ['mcp.access'];
+
+  if (!authServerUrl) {
+    throw new Error(`No authorization server for ${serverName}`);
+  }
+
+  // Create XAA middleware and connect
   const xaaMiddleware = withCrossAppAccess({
     idpUrl: config.idpUrl,
     idToken,
     idpClientId: config.clientId,
     idpClientSecret: config.clientSecret,
-    mcpAuthorisationServerUrl: config.authServerUrl,
-    mcpResourceUrl: config.mcpAudience,
+    mcpAuthorisationServerUrl: authServerUrl,
+    mcpResourceUrl: resourceUrl,
     mcpClientId: config.clientId,
     mcpClientSecret: config.clientSecret,
-    scope: ['todos.read', 'mcp.access'],
+    scope: scopes,
   });
 
   const enhancedFetch = applyMiddlewares(xaaMiddleware)(fetch);
 
   const transport = new StreamableHTTPClientTransport(
-    new URL(`${config.mcpServerUrl}/mcp`),
+    new URL(`${serverConfig.url}/mcp`),
     { fetch: enhancedFetch }
   );
 
@@ -187,74 +301,152 @@ async function connectToMcp(idToken: string): Promise<Client> {
 
   await client.connect(transport);
 
-  // Try to get server info (may be undefined due to SDK version)
-  const serverInfo = client.getServerVersion();
-  if (serverInfo?.name) {
-    spinner.succeed(`Connected to ${chalk.cyan(serverInfo.name)} v${serverInfo.version ?? '?'}`);
-  } else {
-    // Fallback: just show connected
-    spinner.succeed('Connected to MCP server');
+  const connectedServer: ConnectedMcpServer = {
+    config: serverConfig,
+    client,
+    oauthMetadata: oauthMetadata || undefined,
+  };
+
+  connectedServers.set(serverName, connectedServer);
+  console.log(chalk.green(`  ✔ Connected to ${serverName} via XAA`));
+
+  return connectedServer;
+}
+
+// Discover tools from all servers (requires connection for now, but only once per server)
+async function discoverServerCapabilities(): Promise<void> {
+  const spinner = ora('Discovering MCP server capabilities...').start();
+
+  for (const serverConfig of mcpServers) {
+    spinner.text = `Checking ${serverConfig.name}...`;
+    serverConfigs.set(serverConfig.name, serverConfig);
+
+    try {
+      // First try to get manifest without connection
+      const manifest = await fetchServerManifest(serverConfig);
+
+      if (manifest.tools.length > 0 || manifest.resources.length > 0) {
+        // Use manifest data
+        for (const tool of manifest.tools) {
+          allTools.push(tool);
+          toolServerMap.set(tool.name, serverConfig.name);
+        }
+        for (const resource of manifest.resources) {
+          allResources.push(resource);
+          resourceServerMap.set(resource.uri, serverConfig.name);
+        }
+        console.log(chalk.gray(`  ${serverConfig.name}: ${manifest.tools.length} tools, ${manifest.resources.length} resources (from manifest)`));
+      } else {
+        // No manifest - we need to connect to discover
+        // For now, connect and discover, then disconnect
+        // In production, you might want to cache this or use a manifest endpoint
+        spinner.text = `Connecting to ${serverConfig.name} to discover capabilities...`;
+
+        const server = await connectToServer(serverConfig.name);
+
+        try {
+          const toolsResult = await server.client.listTools();
+          for (const t of toolsResult.tools) {
+            const tool: ToolDefinition = {
+              name: t.name,
+              description: t.description || '',
+              inputSchema: t.inputSchema as Record<string, unknown>,
+            };
+            allTools.push(tool);
+            toolServerMap.set(t.name, serverConfig.name);
+          }
+        } catch {
+          // Server might not support tools
+        }
+
+        try {
+          const resourcesResult = await server.client.listResources();
+          for (const r of resourcesResult.resources) {
+            const resource: ResourceDefinition = {
+              uri: r.uri,
+              name: r.name,
+              description: r.description,
+            };
+            allResources.push(resource);
+            resourceServerMap.set(r.uri, serverConfig.name);
+          }
+        } catch {
+          // Server might not support resources
+        }
+
+        const toolCount = allTools.filter(t => toolServerMap.get(t.name) === serverConfig.name).length;
+        const resourceCount = allResources.filter(r => resourceServerMap.get(r.uri) === serverConfig.name).length;
+        console.log(chalk.gray(`  ${serverConfig.name}: ${toolCount} tools, ${resourceCount} resources`));
+      }
+    } catch (error) {
+      spinner.text = `Failed to get capabilities for ${serverConfig.name}`;
+      console.error(chalk.red(`  ${serverConfig.name}: ${error instanceof Error ? error.message : 'Unknown error'}`));
+    }
   }
 
-  // Show XAA flow completion
-  console.log(chalk.green('✔ Enterprise Managed Authorization (Cross-App Access) flow complete'));
-
-  return client;
+  spinner.succeed(`Discovered ${allTools.length} tools, ${allResources.length} resources across ${mcpServers.length} server(s)`);
 }
 
-// Convert MCP tools to Claude tools format
-function mcpToolsToClaudeTools(tools: McpTool[]): Anthropic.Tool[] {
-  return tools.map((tool) => ({
-    name: tool.name,
-    description: tool.description || `MCP tool: ${tool.name}`,
-    input_schema: tool.inputSchema as Anthropic.Tool['input_schema'],
-  }));
-}
+// Convert tools to Claude format
+function toolsToClaudeFormat(): Anthropic.Tool[] {
+  const claudeTools: Anthropic.Tool[] = [];
 
-// Create resource reading tools for Claude
-function createResourceTools(resources: McpResource[]): Anthropic.Tool[] {
-  return [
-    {
+  // Resource tools
+  if (allResources.length > 0) {
+    claudeTools.push({
       name: 'list_resources',
-      description: 'List all available MCP resources',
+      description: 'List all available MCP resources from all servers',
       input_schema: {
         type: 'object' as const,
         properties: {},
         required: [],
       },
-    },
-    {
+    });
+
+    claudeTools.push({
       name: 'read_resource',
-      description: `Read content from an MCP resource. Available resources: ${resources.map((r) => r.uri).join(', ')}`,
+      description: `Read content from an MCP resource. Available: ${allResources.map((r) => `${r.uri} [${resourceServerMap.get(r.uri)}]`).join(', ')}`,
       input_schema: {
         type: 'object' as const,
         properties: {
           uri: {
             type: 'string',
             description: 'The URI of the resource to read',
-            enum: resources.map((r) => r.uri),
+            enum: allResources.map((r) => r.uri),
           },
         },
         required: ['uri'],
       },
-    },
-  ];
+    });
+  }
+
+  // MCP tools
+  for (const tool of allTools) {
+    const serverName = toolServerMap.get(tool.name);
+    claudeTools.push({
+      name: tool.name,
+      description: `[${serverName}] ${tool.description || `MCP tool: ${tool.name}`}`,
+      input_schema: tool.inputSchema as Anthropic.Tool['input_schema'],
+    });
+  }
+
+  return claudeTools;
 }
 
-// Handle tool calls from Claude
+// Handle tool calls - LAZY CONNECTION HERE
 async function handleToolCall(
-  client: Client,
-  resources: McpResource[],
   toolName: string,
   toolInput: Record<string, unknown>
 ): Promise<string> {
   try {
+    // Handle built-in resource tools
     if (toolName === 'list_resources') {
       return JSON.stringify(
-        resources.map((r) => ({
+        allResources.map((r) => ({
           uri: r.uri,
           name: r.name,
           description: r.description,
+          server: resourceServerMap.get(r.uri),
         })),
         null,
         2
@@ -263,7 +455,19 @@ async function handleToolCall(
 
     if (toolName === 'read_resource') {
       const uri = toolInput.uri as string;
-      const result = await client.readResource({ uri });
+      const serverName = resourceServerMap.get(uri);
+
+      if (!serverName) {
+        return `Error: Unknown resource URI: ${uri}`;
+      }
+
+      const server = connectedServers.get(serverName);
+      if (!server) {
+        return `Error: Server ${serverName} not connected`;
+      }
+
+      console.log(chalk.gray(`  → ${serverName}`));
+      const result = await server.client.readResource({ uri });
       const contents = result.contents.map((c) => {
         if ('text' in c) return c.text;
         if ('blob' in c) return `[Binary data: ${c.mimeType}]`;
@@ -272,8 +476,20 @@ async function handleToolCall(
       return contents.join('\n');
     }
 
-    // Handle MCP tools
-    const result = await client.callTool({ name: toolName, arguments: toolInput });
+    // Handle MCP tools - use existing connection
+    const serverName = toolServerMap.get(toolName);
+
+    if (!serverName) {
+      return `Error: Unknown tool: ${toolName}`;
+    }
+
+    const server = connectedServers.get(serverName);
+    if (!server) {
+      return `Error: Server ${serverName} not connected`;
+    }
+
+    console.log(chalk.gray(`  → ${serverName}`));
+    const result = await server.client.callTool({ name: toolName, arguments: toolInput });
     if (result.content && Array.isArray(result.content)) {
       return result.content
         .map((c) => {
@@ -289,13 +505,9 @@ async function handleToolCall(
 }
 
 // Interactive chat loop
-async function runInteractiveChat(
-  anthropic: Anthropic,
-  mcpClient: Client,
-  tools: Anthropic.Tool[],
-  resources: McpResource[]
-) {
+async function runInteractiveChat(anthropic: Anthropic) {
   const conversationHistory: Anthropic.MessageParam[] = [];
+  const tools = toolsToClaudeFormat();
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -303,10 +515,8 @@ async function runInteractiveChat(
     terminal: true,
   });
 
-  // Prompt helper that ensures stdin stays active
   const prompt = (query: string): Promise<string> =>
     new Promise((resolve) => {
-      // Resume stdin to ensure event loop stays alive (fixes issue with ora spinner)
       if (process.stdin.isPaused()) {
         process.stdin.resume();
       }
@@ -318,16 +528,30 @@ async function runInteractiveChat(
 
   console.log('\n' + chalk.bold.green('=== MCP Interactive Chat ==='));
   console.log(chalk.gray('Chat with Claude about your MCP resources.'));
-  console.log(chalk.gray('Commands: /resources, /tools, /clear, /logout, /quit\n'));
+  console.log(chalk.gray('Commands: /servers, /resources, /tools, /clear, /logout, /quit\n'));
 
-  const systemPrompt = `You are a helpful assistant that can interact with an MCP (Model Context Protocol) server.
-You have access to tools that let you read resources from the server.
+  const serverList = mcpServers.map(s => {
+    const toolCount = allTools.filter(t => toolServerMap.get(t.name) === s.name).length;
+    const resourceCount = allResources.filter(r => resourceServerMap.get(r.uri) === s.name).length;
+    return `- ${s.name}: ${toolCount} tools, ${resourceCount} resources`;
+  }).join('\n');
+
+  const resourceList = allResources
+    .map((r) => `- ${r.uri} [${resourceServerMap.get(r.uri)}]: ${r.description || r.name}`)
+    .join('\n');
+
+  const systemPrompt = `You are a helpful assistant that can interact with multiple MCP servers.
+All servers are connected and ready.
+
+Connected MCP Servers:
+${serverList}
 
 Available resources:
-${resources.map((r) => `- ${r.uri}: ${r.description || r.name}`).join('\n')}
+${resourceList || 'None'}
 
-When users ask about their data, use the read_resource tool to fetch the information.
-Be concise and helpful in your responses. Format data nicely when presenting it.`;
+When users ask about their data, use the appropriate tools.
+Tool descriptions show which server they belong to in brackets [server_name].
+Be concise and helpful in your responses.`;
 
   while (true) {
     const userInput = await prompt(chalk.blue('You: '));
@@ -346,12 +570,25 @@ Be concise and helpful in your responses. Format data nicely when presenting it.
         console.log(chalk.gray('Conversation cleared.\n'));
         continue;
       }
+      if (cmd === 'servers') {
+        console.log(chalk.cyan('\nConnected Servers:'));
+        for (const [name, server] of connectedServers) {
+          const toolCount = allTools.filter(t => toolServerMap.get(t.name) === name).length;
+          const resourceCount = allResources.filter(r => resourceServerMap.get(r.uri) === name).length;
+          console.log(`  ${chalk.bold(name)} ${chalk.green('●')}`);
+          console.log(`    URL: ${chalk.gray(server.config.url)}`);
+          console.log(`    Tools: ${toolCount}, Resources: ${resourceCount}`);
+        }
+        console.log('');
+        continue;
+      }
       if (cmd === 'resources') {
         console.log(chalk.cyan('\nAvailable Resources:'));
-        for (const r of resources) {
-          console.log(`  ${chalk.bold(r.uri)}`);
+        for (const r of allResources) {
+          console.log(`  ${chalk.bold(r.uri)} ${chalk.gray(`[${resourceServerMap.get(r.uri)}]`)}`);
           if (r.description) console.log(`    ${chalk.gray(r.description)}`);
         }
+        if (allResources.length === 0) console.log(chalk.gray('  No resources available'));
         console.log('');
         continue;
       }
@@ -370,13 +607,11 @@ Be concise and helpful in your responses. Format data nicely when presenting it.
         console.log(chalk.gray('Session ended. Restart CLI to re-authenticate.\n'));
         continue;
       }
-      console.log(chalk.red('Unknown command. Try /resources, /tools, /clear, /logout, or /quit\n'));
+      console.log(chalk.red('Unknown command. Try /servers, /resources, /tools, /clear, /logout, or /quit\n'));
       continue;
     }
 
-    // Track history length before this turn
     const historyLengthBefore = conversationHistory.length;
-
     conversationHistory.push({ role: 'user', content: userInput });
 
     const spinner = ora({ text: 'Thinking...', color: 'cyan', stream: process.stderr }).start();
@@ -390,25 +625,19 @@ Be concise and helpful in your responses. Format data nicely when presenting it.
         messages: conversationHistory,
       });
 
-      // Handle tool use loop
       while (response.stop_reason === 'tool_use') {
         const toolUseBlocks = response.content.filter(
           (block): block is Anthropic.ToolUseBlock => block.type === 'tool_use'
         );
 
         spinner.text = `Using ${toolUseBlocks.length} tool(s)...`;
-
-        // Add assistant's tool use response to history
         conversationHistory.push({ role: 'assistant', content: response.content });
 
-        // Execute tools and collect results
         const toolResults: Anthropic.ToolResultBlockParam[] = [];
         for (const toolUse of toolUseBlocks) {
           spinner.text = `Calling ${toolUse.name}...`;
           try {
             const result = await handleToolCall(
-              mcpClient,
-              resources,
               toolUse.name,
               toolUse.input as Record<string, unknown>
             );
@@ -427,7 +656,6 @@ Be concise and helpful in your responses. Format data nicely when presenting it.
           }
         }
 
-        // Add tool results as user message
         conversationHistory.push({ role: 'user', content: toolResults });
 
         spinner.text = 'Processing results...';
@@ -441,11 +669,8 @@ Be concise and helpful in your responses. Format data nicely when presenting it.
       }
 
       spinner.stop();
-
-      // Add final assistant response to history
       conversationHistory.push({ role: 'assistant', content: response.content });
 
-      // Extract and display text response
       const textContent = response.content.find(
         (block): block is Anthropic.TextBlock => block.type === 'text'
       );
@@ -459,18 +684,11 @@ Be concise and helpful in your responses. Format data nicely when presenting it.
       spinner.fail('Error');
       if (error instanceof Error) {
         console.error(chalk.red(`Error: ${error.message}`));
-        if ('status' in error) {
-          console.error(chalk.gray(`Status: ${(error as any).status}`));
-        }
-        if ('error' in error) {
-          console.error(chalk.gray(`Details: ${JSON.stringify((error as any).error, null, 2)}`));
-        }
       } else {
         console.error(chalk.red(`Error: ${JSON.stringify(error)}`));
       }
       console.log('');
 
-      // Rollback to state before this turn
       while (conversationHistory.length > historyLengthBefore) {
         conversationHistory.pop();
       }
@@ -478,60 +696,45 @@ Be concise and helpful in your responses. Format data nicely when presenting it.
   }
 
   rl.close();
-  await mcpClient.close();
+
+  // Close all connections
+  for (const server of connectedServers.values()) {
+    await server.client.close();
+  }
 }
 
 // Main
 async function main() {
-  console.log(chalk.bold.magenta('\n  MCP Interactive CLI with Claude AI\n'));
+  console.log(chalk.bold.magenta('\n  MCP Interactive CLI with Claude AI'));
+  console.log(chalk.bold.magenta('  Multi-Server Cross-App Access (XAA)\n'));
 
-  // Check for API key
   if (!config.anthropicApiKey) {
     console.error(chalk.red('Error: ANTHROPIC_API_KEY not set in .env file'));
-    console.log(chalk.gray('Add your API key to packages/mcp-client-cli/.env'));
     process.exit(1);
+  }
+
+  if (mcpServers.length === 0) {
+    console.error(chalk.red('Error: No MCP servers configured'));
+    process.exit(1);
+  }
+
+  console.log(chalk.gray(`Configured ${mcpServers.length} MCP server(s):`));
+  for (const server of mcpServers) {
+    console.log(chalk.gray(`  - ${server.name}: ${server.url}`));
   }
 
   const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
 
-  // Authenticate
-  const idToken = await authenticate();
+  // Step 1: Authenticate once with IDP - keep ID token
+  idToken = await authenticate();
 
-  // Connect to MCP
-  const mcpClient = await connectToMcp(idToken);
+  // Step 2: Discover capabilities (may connect temporarily, then disconnect)
+  await discoverServerCapabilities();
 
-  // Fetch available resources and tools
-  const spinner = ora('Fetching MCP capabilities...').start();
+  console.log(chalk.green('\n✔ Ready - all servers connected'));
 
-  const resourcesResult = await mcpClient.listResources();
-  const resources: McpResource[] = resourcesResult.resources.map((r) => ({
-    uri: r.uri,
-    name: r.name,
-    description: r.description,
-  }));
-
-  let mcpTools: McpTool[] = [];
-  try {
-    const toolsResult = await mcpClient.listTools();
-    mcpTools = toolsResult.tools.map((t) => ({
-      name: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema as Record<string, unknown>,
-    }));
-  } catch {
-    // Server might not support tools
-  }
-
-  spinner.succeed(`Found ${chalk.cyan(resources.length)} resources and ${chalk.cyan(mcpTools.length)} tools`);
-
-  // Build Claude tools
-  const claudeTools: Anthropic.Tool[] = [
-    ...createResourceTools(resources),
-    ...mcpToolsToClaudeTools(mcpTools),
-  ];
-
-  // Start interactive chat
-  await runInteractiveChat(anthropic, mcpClient, claudeTools, resources);
+  // Step 3: Start chat - connections happen on demand
+  await runInteractiveChat(anthropic);
 }
 
 main().catch((error) => {
